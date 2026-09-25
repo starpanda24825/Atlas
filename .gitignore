@@ -1,0 +1,25 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local model weights (too large for GitHub — keep these on disk only)
+*.gguf
+models/.cache/
+
+# Local data / runtime artifacts
+chroma_db/
+logs/
+*.log
+
+# Secrets
+.env
+.env.local
