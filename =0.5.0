@@ -1659,3 +1659,21 @@ Collecting llama-index-llms-openai<0.8,>=0.7.0 (from llama-index)
   Using cached llama_index_llms_openai-0.7.8-py3-none-any.whl.metadata (3.0 kB)
   Obtaining dependency information for llama-index-llms-openai<0.8,>=0.7.0 from https://files.pythonhosted.org/packages/33/66/fc6818ea699c8cfd0ae780a1c0f04389458bab8a895ac5ff17bfc47e7559/llama_index_llms_openai-0.7.7-py3-none-any.whl.metadata
   Using cached llama_index_llms_openai-0.7.7-py3-none-any.whl.metadata (3.0 kB)
+  Obtaining dependency information for llama-index-llms-openai<0.8,>=0.7.0 from https://files.pythonhosted.org/packages/82/c0/7e4fcd14dc8e7a47a8f16df33882f4cede3a526fd9d6af6d793c18188964/llama_index_llms_openai-0.7.6-py3-none-any.whl.metadata
+  Using cached llama_index_llms_openai-0.7.6-py3-none-any.whl.metadata (3.0 kB)
+  Obtaining dependency information for llama-index-llms-openai<0.8,>=0.7.0 from https://files.pythonhosted.org/packages/63/62/a847e9a94c2f92926c30188259f9f86e019dcc45122bbb222dea35a74c02/llama_index_llms_openai-0.7.5-py3-none-any.whl.metadata
+  Using cached llama_index_llms_openai-0.7.5-py3-none-any.whl.metadata (3.0 kB)
+  Obtaining dependency information for llama-index-llms-openai<0.8,>=0.7.0 from https://files.pythonhosted.org/packages/50/e8/1edce9dad3c7b55e37ca27723f7e8918e71e270bb3e67b49e90abdfaa32f/llama_index_llms_openai-0.7.4-py3-none-any.whl.metadata
+  Using cached llama_index_llms_openai-0.7.4-py3-none-any.whl.metadata (3.0 kB)
+  Obtaining dependency information for llama-index-llms-openai<0.8,>=0.7.0 from https://files.pythonhosted.org/packages/99/1f/da6ec7e5f998fac3257def0b99a3f8a69dbcb17dc685dba65944e6fd3962/llama_index_llms_openai-0.7.3-py3-none-any.whl.metadata
+  Using cached llama_index_llms_openai-0.7.3-py3-none-any.whl.metadata (3.0 kB)
+  Obtaining dependency information for llama-index-llms-openai<0.8,>=0.7.0 from https://files.pythonhosted.org/packages/1f/80/59f219bdb5d1b9c1384b388bc49f13b1b6973bd5e60be09c9d25c3bd5e20/llama_index_llms_openai-0.7.2-py3-none-any.whl.metadata
+  Using cached llama_index_llms_openai-0.7.2-py3-none-any.whl.metadata (3.0 kB)
+  Obtaining dependency information for llama-index-llms-openai<0.8,>=0.7.0 from https://files.pythonhosted.org/packages/1b/ae/a7225deea97bfa647925d1bbb7e234d8eb72632768879db44c4fada788e7/llama_index_llms_openai-0.7.1-py3-none-any.whl.metadata
+  Using cached llama_index_llms_openai-0.7.1-py3-none-any.whl.metadata (3.0 kB)
+  Obtaining dependency information for llama-index-llms-openai<0.8,>=0.7.0 from https://files.pythonhosted.org/packages/5d/0b/6a4a215eeb8fcaaf9114132ad843403a227ecc4ef6f7e6bd670e561e1a56/llama_index_llms_openai-0.7.0-py3-none-any.whl.metadata
+  Using cached llama_index_llms_openai-0.7.0-py3-none-any.whl.metadata (3.0 kB)
+INFO: pip is still looking at multiple versions of llama-index-embeddings-google-genai to determine which version is compatible with other requirements. This could take a while.
+INFO: pip is looking at multiple versions of google-adk[extensions] to determine which version is compatible with other requirements. This could take a while.
+INFO: pip is still looking at multiple versions of opentelemetry-exporter-otlp-proto-grpc to determine which version is compatible with other requirements. This could take a while.
+INFO: This is taking longer than usual. You might need to provide the dependency resolver with stricter constraints to reduce runtime. See https://pip.pypa.io/warnings/backtracking for guidance. If you want to abort this run, press Ctrl + C.
