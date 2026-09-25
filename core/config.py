@@ -39,6 +39,20 @@ def _env_or(name: str, default: str) -> str:
     return value.strip() if value and value.strip() else default
 
 
+def _int_env(name: str, default: int) -> int:
+    """Read a positive integer from the environment, falling back to `default`.
+
+    A malformed or non-positive value falls back instead of raising: every
+    module imports core.config, so a typo in .env must not make Atlas
+    unimportable.
+    """
+    try:
+        value = int(_env_or(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 def _parse_env_file(path: Path) -> dict[str, str]:
     """Parse a simple KEY=VALUE .env file into a dict.
 
@@ -136,6 +150,19 @@ DEEP_MODEL_GPU_LAYERS: int = 99
 LLM_HOST: str = "127.0.0.1"
 LLAMA_SERVER_BIN: Path = LLAMA_CPP_DIR / "llama-server"
 DEEP_MODEL_IDLE_TIMEOUT: int = 300  # seconds idle before the deep server is shut down
+
+# Free VRAM the deep model needs before it is worth trying to load it, in MiB.
+#
+# The fast and deep servers cannot both be resident on this project's 8GB card.
+# Measured here: the fast server holds 6630 MiB (4.7GB of weights plus a q8_0 KV
+# cache for a 24576-token context), the deep model settles at 2778 MiB, and a
+# deep start alongside the fast server dies with "cudaMalloc failed: out of
+# memory" asking for 1536 MiB of KV cache. This number sits above the deep
+# model's measured usage (2778) and above what the fast server leaves free
+# (~1558, so the swap does happen here), while a 16GB card would have ~9.7GB
+# free and would keep both. That is why the check is measured rather than
+# "always stop the fast server".
+DEEP_MODEL_MIN_FREE_VRAM_MB: int = _int_env("ATLAS_DEEP_MIN_FREE_VRAM_MB", 3584)
 SERVER_READY_TIMEOUT: float = 60.0  # seconds to wait for /health to return 200
 SERVER_POLL_INTERVAL: float = 0.5  # seconds between /health polls
 
@@ -248,6 +275,105 @@ MEM0_INCLUDE_RESPONSE: bool = _env_or(
 ).lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
+# SKILLS
+# ---------------------------------------------------------------------------
+
+# Skill descriptions live in their own collection. They are a different kind of
+# thing from memories and notes, and mixing them into atlas_semantic means a
+# skill description can outrank the fact the user actually asked about.
+SKILL_REGISTRY_COLLECTION: str = "skill_registry"
+
+# Floor for find_skill(), measured rather than guessed. nomic-embed-text
+# compresses short-text similarity into roughly 0.4-0.8, so an absolute floor
+# here is a real trade-off and 0.30 (MEMORY_RELEVANCE_THRESHOLD) is useless:
+#   genuine matches  0.675 0.678 0.688 0.786   (min 0.675)
+#   no such skill    0.390-0.547                 (max 0.547)
+# 0.60 sits in the gap. The one overlap is "play some music" scoring 0.693
+# against a skill described as "plays a short bell sound" - a genuine partial
+# match, not a spurious one, and worth accepting.
+SKILL_RELEVANCE_THRESHOLD: float = 0.60
+
+# --- Execution sandbox ------------------------------------------------------
+#
+# Untrusted skill code runs in a subprocess under bubblewrap wherever that
+# works. Measured on this machine, a sandboxed process cannot reach the network
+# ("Network is unreachable"), cannot list the user's home directory, and cannot
+# write anywhere except the directory below. Where bubblewrap is unavailable
+# Atlas degrades to rlimits only, which still caps memory but enforces no
+# confinement at all - check SandboxResult.isolation before trusting a result.
+
+# Where a sandboxed skill may write. Each call gets its own subdirectory, and
+# that path comes back as SandboxResult.artifacts_dir.
+SKILL_SANDBOX_DIR: Path = Path(_env_or("ATLAS_SANDBOX_DIR", "/tmp/atlas_sandbox"))
+
+# Hard wall-clock ceiling for one sandboxed call.
+SKILL_SANDBOX_TIMEOUT: int = _int_env("ATLAS_SANDBOX_TIMEOUT", 30)
+
+# Address-space ceiling in MB, applied with resource.setrlimit(RLIMIT_AS).
+#
+# 512 MB is a genuine cap - a 700 MB allocation fails with MemoryError - but it
+# is measured against *virtual* address space, and OpenBLAS reserves far more of
+# that than it ever uses: measured here, "import numpy" aborts under 768 MB and
+# needs about 1024 MB. A skill that needs BLAS should declare it with a MEMORY:
+# line in its docstring; sandbox.py recognises the OpenBLAS signature and says
+# so rather than reporting an unexplained abort.
+SKILL_SANDBOX_MEMORY_MB: int = _int_env("ATLAS_SANDBOX_MEMORY_MB", 512)
+
+# Ceiling on what a skill may ask for with MEMORY:, so a generated skill cannot
+# claim the whole machine.
+SKILL_SANDBOX_MAX_MEMORY_MB: int = _int_env("ATLAS_SANDBOX_MAX_MEMORY_MB", 4096)
+
+# Truncation point for stdout/stderr carried in the result. The complete files
+# stay in the run directory, so this bounds only what is held in memory.
+SKILL_SANDBOX_MAX_OUTPUT: int = _int_env("ATLAS_SANDBOX_MAX_OUTPUT", 64_000)
+
+# "auto" prefers bubblewrap and falls back to rlimits-only; "bwrap" insists on
+# it and fails loudly rather than quietly running untrusted code unconfined;
+# "rlimits" never tries.
+SKILL_SANDBOX_ISOLATION: str = _env_or("ATLAS_SANDBOX_ISOLATION", "auto").lower()
+
+# Hosts a skill may reach once the user has approved network access. A skill
+# declares what it wants with a NETWORK: line; validate_skill() reports anything
+# outside this list. Loopback is allowed because it cannot leave the machine.
+SKILL_NETWORK_WHITELIST: tuple[str, ...] = (
+    "localhost",
+    "127.0.0.1",
+    "::1",
+)
+
+# --- Skill building ---------------------------------------------------------
+
+# How many times the deep model may be asked to fix its own output. One initial
+# attempt plus this many corrections; the build stops early the moment the
+# skill's own test() passes.
+SKILL_MAX_FIX_ITERATIONS: int = _int_env("ATLAS_SKILL_MAX_FIX_ITERATIONS", 3)
+
+# Tokens allowed per generated file. The 30B produced a complete, working skill
+# in 179 tokens here, so this is generous rather than tight - a file that needs
+# more than this is one the model is struggling with.
+SKILL_BUILDER_MAX_TOKENS: int = _int_env("ATLAS_SKILL_BUILDER_MAX_TOKENS", 2048)
+
+# Sampling temperature for code generation. Low, because this is an artifact to
+# be executed rather than prose to be read: the same description should produce
+# the same skill.
+SKILL_BUILDER_TEMPERATURE: float = float(_env_or("ATLAS_SKILL_BUILDER_TEMPERATURE", "0.2"))
+
+# Whether the builder may fall back to the fast model when the deep one cannot
+# be loaded at all (no VRAM even after the swap, or the weights are missing).
+# A weaker skill beats no skill, and the proposal records which model wrote it.
+SKILL_BUILDER_FAST_FALLBACK: bool = _env_or(
+    "ATLAS_SKILL_BUILDER_FAST_FALLBACK", "true"
+).lower() in ("1", "true", "yes")
+
+# Where the builder keeps its own small state: recent skill errors (input to
+# background refinement) and refinements waiting for the user to look at them.
+# Sits beside skills/library/ rather than inside it, because the registry scans
+# that directory for .py files and this is not one.
+SKILL_BUILDER_STATE: Path = Path(
+    _env_or("ATLAS_SKILL_BUILDER_STATE", str(SKILLS_DIR.parent / "builder_state.json"))
+)
+
+# ---------------------------------------------------------------------------
 # TRADING
 # ---------------------------------------------------------------------------
 
@@ -293,6 +419,7 @@ LAZY_DIRS: tuple[Path, ...] = (
     CHROMA_DIR,
     MEM0_DIR,
     WAKE_WORD_MODEL_DIR,
+    SKILL_SANDBOX_DIR,
 )
 
 

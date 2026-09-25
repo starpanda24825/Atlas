@@ -44,6 +44,7 @@ from core.config import (
     DEEP_MODEL_CTX,
     DEEP_MODEL_GPU_LAYERS,
     DEEP_MODEL_IDLE_TIMEOUT,
+    DEEP_MODEL_MIN_FREE_VRAM_MB,
     DEEP_MODEL_PATH,
     DEEP_MODEL_PORT,
     FAST_MODEL_CTX,
@@ -109,12 +110,16 @@ class LLMServerManager:
         self.ready_timeout: float = SERVER_READY_TIMEOUT
         self.poll_interval: float = SERVER_POLL_INTERVAL
         self.idle_timeout: int = DEEP_MODEL_IDLE_TIMEOUT
+        self.deep_min_free_vram_mb: float = DEEP_MODEL_MIN_FREE_VRAM_MB
 
         self._lock = threading.RLock()
         self._fast_process: subprocess.Popen[bytes] | None = None
         self._deep_process: subprocess.Popen[bytes] | None = None
         self._log_files: dict[str, IO[bytes]] = {}
         self._deep_shutdown_timer: threading.Timer | None = None
+        #: Set when the fast server was stopped to free VRAM for the deep one,
+        #: so it is only restarted if it was actually taken away.
+        self._fast_suspended = False
 
     # ------------------------------------------------------------------
     # Introspection
@@ -328,6 +333,125 @@ class LLMServerManager:
     # Deep model on demand
     # ------------------------------------------------------------------
 
+    @property
+    def fast_suspended(self) -> bool:
+        """True while the fast server is stopped to make room for the deep one."""
+        return self._fast_suspended
+
+    def free_vram_mb(self) -> float | None:
+        """Free VRAM on device 0 in MiB, or None when it cannot be determined.
+
+        ``nvidia-smi`` is not guaranteed to exist (and this is not fatal): when
+        the answer is unknown the caller simply tries and recovers, rather than
+        assuming the worst and stopping a healthy server.
+        """
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            return float(result.stdout.strip().splitlines()[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _suspend_fast_for_deep(self) -> bool:
+        """Stop the fast server when the deep model will not otherwise fit.
+
+        Returns True only when the fast server was actually stopped, so the
+        caller knows whether there is anything to restore later. A card that
+        can hold both models keeps the fast server running.
+        """
+        with self._lock:
+            free = self.free_vram_mb()
+            if free is None:
+                return False
+            if free >= self.deep_min_free_vram_mb:
+                logger.debug(
+                    "%.0f MiB free VRAM is enough for the deep model — keeping the "
+                    "fast server resident",
+                    free,
+                )
+                return False
+            if not self._is_alive(self._fast_process):
+                return False
+            logger.info(
+                "freeing VRAM for the deep model: %.0f MiB free, %.0f MiB needed — "
+                "stopping the fast server (it will be restarted when the deep "
+                "model goes idle)",
+                free,
+                self.deep_min_free_vram_mb,
+            )
+            self.stop_fast_server()
+            self._fast_suspended = True
+            return True
+
+    def restore_resident_model(self) -> bool:
+        """Bring the fast model back after a deep-model swap.
+
+        Does nothing unless the fast server was stopped to make room, so an
+        ordinary conversation never pays for this. The deep server is stopped
+        first: on hardware where the swap was needed the two cannot be resident
+        at once, so restoring the fast model means giving up the deep one.
+
+        Returns True when the fast model is serving again.
+        """
+        with self._lock:
+            if not self._fast_suspended:
+                return False
+
+        self.stop_deep_server()
+
+        with self._lock:
+            if not self._fast_suspended:
+                return False  # another thread got there first
+            self._fast_suspended = False
+            try:
+                process = self.start_fast_server()
+            except Exception:
+                logger.exception("could not restart the fast model server")
+                return False
+
+        if not self.is_server_ready(self.fast_port):
+            return self.wait_for_server_ready(self.fast_port, process=process)
+        return True
+
+    def _retry_deep_with_vram_freed(self, process: subprocess.Popen[bytes] | None) -> bool:
+        """Second attempt at the deep server after freeing the fast one.
+
+        The pre-flight VRAM estimate can be wrong — no ``nvidia-smi``, a stale
+        reading, another process holding memory — and the deep server reports
+        failure the same way either way: it exits before ``/health`` ever
+        answers. Since stopping the fast server is the only lever available,
+        this tries it once, and refuses to loop if it was already tried.
+        """
+        with self._lock:
+            if self._fast_suspended:
+                return False
+            if not self._suspend_fast_for_deep():
+                # Either there is no fast server to stop (so there is nothing
+                # left to free) or the VRAM reading says there is room, in
+                # which case a retry would fail identically.
+                return False
+            self._deep_process = None
+            self._terminate("deep", process, 5.0)
+            try:
+                process = self.start_deep_server()
+            except Exception:
+                logger.exception("could not restart the deep server after freeing VRAM")
+                return False
+
+        if self.is_server_ready(self.deep_port):
+            return True
+        return self.wait_for_server_ready(self.deep_port, process=process)
+
     def ensure_deep_available(self) -> bool:
         """Make sure the deep server is up and (re)arm its idle-shutdown timer.
 
@@ -335,24 +459,35 @@ class LLMServerManager:
         ready, then arms a ``DEEP_MODEL_IDLE_TIMEOUT`` timer. Every call
         restarts that timer, so using the deep model during a conversation
         keeps it resident; once the timer fires unnoticed, the server is
-        stopped and the VRAM released.
+        stopped, the VRAM released, and — if it was the fast server that made
+        room — the fast model put back.
+
+        The fast and deep servers cannot both fit in this project's 8GB card,
+        so this will stop the fast server when the free VRAM says it has to.
+        Call :meth:`restore_resident_model` when finished to get the fast model
+        back without waiting out the idle timer.
 
         Returns True when the deep model is ready to serve requests.
         """
         with self._lock:
             process = self._deep_process
             if not self._is_alive(process):
+                self._suspend_fast_for_deep()
                 try:
                     process = self.start_deep_server()
                 except Exception:
                     logger.exception("could not start the deep model server")
+                    self.restore_resident_model()
                     return False
 
         # Waiting happens outside the lock so a concurrent shutdown is not
         # blocked for up to ready_timeout seconds.
         if not self.is_server_ready(self.deep_port):
             if not self.wait_for_server_ready(self.deep_port, process=process):
-                return False
+                if not self._retry_deep_with_vram_freed(process):
+                    # Never leave the user without a model at all.
+                    self.restore_resident_model()
+                    return False
 
         with self._lock:
             self._schedule_deep_shutdown()
@@ -380,6 +515,10 @@ class LLMServerManager:
             self.idle_timeout,
         )
         self.stop_deep_server()
+        # Backstop for any caller that used the deep model and forgot to hand
+        # the machine back: restoring is a no-op unless a swap happened.
+        if self.restore_resident_model():
+            logger.info("fast model restored after the deep model went idle")
 
     # ------------------------------------------------------------------
     # Stopping
@@ -388,7 +527,8 @@ class LLMServerManager:
     def stop_deep_server(self, timeout: float = 15.0) -> None:
         """Terminate the deep server and clean up its timer and log handle.
 
-        Safe to call when the server is not running.
+        Safe to call when the server is not running. Does *not* restore the
+        fast server — use :meth:`restore_resident_model` for that.
         """
         with self._lock:
             self._cancel_deep_shutdown()
@@ -407,6 +547,8 @@ class LLMServerManager:
         """Stop both servers. Intended for daemon shutdown."""
         self.stop_deep_server(timeout=timeout)
         self.stop_fast_server(timeout=timeout)
+        with self._lock:
+            self._fast_suspended = False
 
     def shutdown(self, timeout: float = 15.0) -> None:
         """Alias for :meth:`stop_all` — stop everything cleanly."""

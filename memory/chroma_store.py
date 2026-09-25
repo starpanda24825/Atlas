@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -728,6 +729,51 @@ _PROVIDER_REGISTRY: dict[str, type[EmbeddingProvider]] = {
 }
 
 
+def _accepted_provider_options() -> frozenset[str]:
+    """Every keyword the embedding providers' constructors accept.
+
+    Derived by introspection rather than hand-listed, so it cannot drift when a
+    provider gains an option.
+    """
+    names: set[str] = set()
+    for cls in set(_PROVIDER_REGISTRY.values()):
+        for parameter in inspect.signature(cls.__init__).parameters.values():
+            if parameter.kind in (
+                parameter.POSITIONAL_OR_KEYWORD,
+                parameter.KEYWORD_ONLY,
+            ):
+                names.add(parameter.name)
+    return frozenset(names - {"self", "model"})
+
+
+def reject_unknown_provider_options(options: Mapping[str, Any]) -> None:
+    """Refuse an option that no provider understands.
+
+    Without this, ``ChromaStore(**extra)`` reads a misspelling as a *provider*
+    option, and the consequence is both late and misleading: the store opens
+    happily, at ``CHROMA_DIR``, and only fails at the first embedding with an
+    error blaming an embedding backend the caller never mentioned. A typo in
+    ``persist_dir`` must not be able to point a test at the user's real index.
+    """
+    if not options:
+        return
+
+    accepted = _accepted_provider_options()
+    unknown = sorted(set(options) - accepted)
+    if not unknown:
+        return
+
+    named = ", ".join(repr(name) for name in unknown)
+    verb = "is" if len(unknown) == 1 else "are"
+    message = (
+        f"unknown option {named}: {verb} accepted by neither ChromaStore nor any "
+        f"embedding provider. Provider options: {', '.join(sorted(accepted))}."
+    )
+    if any(re.search(r"dir|path|store|persist", name) for name in unknown):
+        message += f" To choose where the index lives, pass persist_dir=, not {named}."
+    raise ValueError(message)
+
+
 def build_embedding_provider(
     provider: str | EmbeddingProvider | None = None,
     *,
@@ -1031,6 +1077,7 @@ class ChromaStore:
         self._model_choice = model
         self._device_choice = device
         self._provider_options = provider_options
+        reject_unknown_provider_options(provider_options)
         self._provider: EmbeddingProvider | None = embedding_provider
         self._provider_lock = threading.RLock()
 
@@ -1698,6 +1745,22 @@ def _self_test() -> int:
 
     workdir = Path(tempfile.mkdtemp(prefix="atlas-chroma-selftest-"))
     try:
+        # A misspelled option must not be read as a provider option. If it were,
+        # the store would open at CHROMA_DIR — the user's real index — and the
+        # mistake would only surface later, as a confusing embedding error.
+        # persist_dir is still passed here so a regression cannot touch it.
+        for bad in ("store_dir", "persist", "path"):
+            try:
+                ChromaStore(persist_dir=workdir / "guard", **{bad: workdir})
+            except ValueError:
+                rejected = True
+            else:
+                rejected = False
+            check(f"rejects misspelled option {bad!r}", rejected)
+        check("a real provider option is still accepted",
+              ChromaStore(persist_dir=workdir / "opts", batch_size=4).persist_dir
+              == workdir / "opts")
+
         started = time.time()
         store = ChromaStore(persist_dir=workdir)
         provider = store.warm()

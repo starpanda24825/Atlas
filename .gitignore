@@ -19,6 +19,7 @@ models/.cache/
 chroma_db/
 logs/
 *.log
+vault/
 
 # Secrets
 .env
