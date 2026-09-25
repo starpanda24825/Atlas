@@ -120,7 +120,14 @@ FAST_MODEL_PORT: int = 11430
 DEEP_MODEL_PATH: Path = MODELS_DIR / "Qwen_Qwen3-30B-A3B-Q4_K_M.gguf"
 DEEP_MODEL_PORT: int = 11431
 
-FAST_MODEL_CTX: int = 8192
+# Context is sized by the biggest caller, not by the conversation. Analysis of
+# memory/mem0_manager.py shows its fact-extraction prompt alone is ~7,900 tokens
+# (measured: 7,924 on the real tokenizer), and llama.cpp divides --ctx-size
+# evenly between --parallel slots. With 2 slots that puts the per-request budget
+# at FAST_MODEL_CTX / 2, which must clear ~10k for extraction to run at all:
+# 24576 / 2 = 12288 per slot. Lowering this below ~20480 breaks structured
+# memory with a context-overflow error, not with a warning.
+FAST_MODEL_CTX: int = 24576
 DEEP_MODEL_CTX: int = 16384
 FAST_MODEL_GPU_LAYERS: int = 99
 DEEP_MODEL_GPU_LAYERS: int = 99
@@ -175,9 +182,70 @@ DEEP_RESEARCH_MAX_SOURCES: int = 12
 # ---------------------------------------------------------------------------
 
 CHROMA_DIR: Path = BASE_DIR / "chroma_db"
-EMBED_MODEL: str = "nomic-embed-text"
 MEM0_COLLECTION: str = "atlas_memory"
 MEMORY_RELEVANCE_THRESHOLD: float = 0.30
+
+# ChromaDB collections owned by memory/chroma_store.py. The first holds
+# durable facts, preferences and skills; the second holds conversation
+# summaries. Collection names are 3-512 chars of [a-zA-Z0-9._-] (Chroma's rule).
+SEMANTIC_COLLECTION: str = "atlas_semantic"
+CONVERSATION_COLLECTION: str = "atlas_conversations"
+
+# Embeddings are swappable, but vectors from different models are not
+# comparable, so the choice is recorded in each collection's metadata and a
+# change is reported rather than silently mixing spaces.
+#
+#   auto                 first usable backend (see memory/chroma_store.py)
+#   sentence_transformers  local model, no daemon required
+#   ollama               Ollama's /api/embed endpoint
+#   llama_cpp            the fast llama.cpp server's /v1/embeddings endpoint
+#                        (only exists when it was started with --embeddings)
+#   openai               any OpenAI-compatible /v1/embeddings service
+#   chroma               Chroma's built-in ONNX all-MiniLM-L6-v2
+EMBED_PROVIDER: str = _env_or("ATLAS_EMBED_PROVIDER", "auto")
+
+# "nomic-embed-text" is Ollama's tag for the model; chroma_store maps it to the
+# matching Hugging Face repo (nomic-ai/nomic-embed-text-v1.5, 768 dimensions)
+# when a local backend is used, so one setting covers every provider.
+EMBED_MODEL: str = _env_or("ATLAS_EMBED_MODEL", "nomic-embed-text")
+
+# CPU on purpose: nomic-embed-text-v1.5 embeds a document in ~21 ms here, while
+# the single GPU is needed by the 8B/30B language models.
+EMBED_DEVICE: str = _env_or("ATLAS_EMBED_DEVICE", "cpu")
+EMBED_BATCH_SIZE: int = 32
+EMBED_TIMEOUT: float = 30.0
+
+OLLAMA_URL: str = _env_or("OLLAMA_URL", "http://127.0.0.1:11434")
+
+# --- mem0 (structured fact extraction over ChromaDB) -----------------------
+
+# Memory is keyed to one person on one machine. A fixed id keeps that simple and
+# survives reinstalls of the index.
+MEM0_USER_ID: str = _env_or("ATLAS_USER_ID", "atlas_primary_user")
+
+# mem0 keeps its own state (history database, its config.json). Both live inside
+# CHROMA_DIR, which is already gitignored, so all derived memory data sits in one
+# disposable directory.
+MEM0_DIR: Path = CHROMA_DIR / "mem0"
+MEM0_HISTORY_DB: Path = MEM0_DIR / "history.db"
+
+# How many memories to recall for a query. Injected into every prompt, so it
+# stays small: recall competes with the conversation for the context window.
+MEM0_SEARCH_LIMIT: int = 5
+
+# Ceiling for mem0's extraction output. It answers with a JSON object, so this
+# only has to cover the facts plus their metadata.
+MEM0_LLM_MAX_TOKENS: int = 2048
+
+# Whether Atlas's own reply is fed to mem0 alongside the user's turn.
+#
+# Measured with Qwen3-8B: including it produced "User was reminded they drink
+# cortados" - a fact about Atlas's sentence, not about the user - sitting next to
+# the correct memories and taking up a recall slot. Extraction from the user's
+# turn alone kept the real facts. Turn this on to hand mem0 the whole exchange.
+MEM0_INCLUDE_RESPONSE: bool = _env_or(
+    "ATLAS_MEM0_INCLUDE_RESPONSE", "false"
+).lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
 # TRADING
@@ -223,6 +291,7 @@ REQUIRED_DIRS: tuple[Path, ...] = (
 # so a missing one is only worth a warning, not an error.
 LAZY_DIRS: tuple[Path, ...] = (
     CHROMA_DIR,
+    MEM0_DIR,
     WAKE_WORD_MODEL_DIR,
 )
 

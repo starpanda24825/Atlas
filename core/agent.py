@@ -57,6 +57,8 @@ inventing an answer. The expected shape is:
 ``memory_manager``
     ``retrieve(query) -> str`` — recall relevant memories.
     ``extract_and_store(user_input, response)`` — background, fire-and-forget.
+    ``context_for(query) -> str`` — the section injected into every prompt;
+    checked first, so a manager can offer recall without it being a tool call.
     (``save``/``search``/``add``/``remember`` are also accepted.)
 
 ``skill_registry``
@@ -157,12 +159,15 @@ How to act
 - Never guess at external facts. If something involves the weather, news, the \
 web, a file, a device, or anything outside this conversation, call the \
 appropriate tool instead of answering from memory.
+- Anything listed under "What Atlas remembers about the user:" has already been \
+recalled for you. Treat those as things you know and use them directly - do \
+not call retrieve_memory to look up something that is already in front of you.
 - If the user asks about their own preferences, background, projects or \
-anything you may have been told before, call retrieve_memory first. This \
-includes broad questions such as "what do you know about me" - always look \
-before answering those. Do not answer personal questions from imagination. If \
-memory comes back empty or unavailable, say you have no notes on it rather \
-than inventing something plausible.
+anything you may have been told before and it is not in that list, call \
+retrieve_memory. This includes broad questions such as "what do you know \
+about me" - always look before answering those. Do not answer personal \
+questions from imagination. If memory comes back empty or unavailable, say you \
+have no notes on it rather than inventing something plausible.
 - Never claim to have done something you did not do. Only say a timer is set, \
 a skill exists, or an order was placed if a tool actually reported success.
 - You may call several tools in a row, and you may call them again if the first \
@@ -796,6 +801,13 @@ class AtlasAgent:
             if message.get("role") in ("user", "assistant") and message.get("content"):
                 messages.append({"role": message["role"], "content": message["content"]})
 
+        # What Atlas already knows, recalled for this turn. Injected every turn
+        # rather than left to the model to request, so it starts out knowing
+        # what it knows instead of having to remember to look.
+        memory_note = self._memory_context(user_input)
+        if memory_note:
+            messages.append({"role": "system", "content": memory_note})
+
         # Surface a pending confirmation so the model can act on the user's
         # reply. The decision stays with the model — this only supplies context,
         # it does not parse the answer for "yes" or "no".
@@ -809,6 +821,36 @@ class AtlasAgent:
 
         messages.append({"role": "user", "content": user_input})
         return messages
+
+    def _memory_context(self, user_input: str) -> str:
+        """Recall what is relevant to this turn, as a prompt section.
+
+        Whatever the memory manager returns is inserted verbatim, heading and
+        all, so the model can see where the facts came from. Returns an empty
+        string — meaning no section is added at all — when nothing is relevant
+        or no memory manager is configured.
+
+        Never raises. Memory is context, not a capability: if recall fails, the
+        turn still happens, just without it.
+        """
+        context = _find_method(
+            self.memory_manager,
+            (
+                "context_for",
+                "memory_context",
+                "recall_context",
+                "retrieve",
+                "search_memories",
+            ),
+        )
+        if context is None:
+            return ""
+        try:
+            text = context(user_input)
+        except Exception:
+            logger.warning("memory recall failed — continuing without it", exc_info=True)
+            return ""
+        return _as_text(text).strip()
 
     def _pending_action_note(self) -> str:
         assert self._pending_action is not None

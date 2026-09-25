@@ -71,6 +71,10 @@ DEEP_TENSOR_OVERRIDE = r"blk\.\d+\.ffn_.*=CPU"
 # with 'expected value for argument', so it must always be passed explicitly.
 FLASH_ATTN = "on"
 
+# KV cache dtype for the fast model, used to keep a wide context inside 8GB of
+# VRAM. See fast_command() for the measurement behind it.
+FAST_KV_CACHE_TYPE = "q8_0"
+
 HEALTH_PATH = "/health"
 
 # Body of a request to the health endpoint; llama.cpp checks the path only.
@@ -142,7 +146,14 @@ class LLMServerManager:
     # ------------------------------------------------------------------
 
     def fast_command(self) -> list[str]:
-        """argv used to launch the fast model server."""
+        """argv used to launch the fast model server.
+
+        The KV cache is quantised because the context is wide for this hardware.
+        Measured on the 8GB card this project targets: 24576 tokens of f16 KV
+        does not fit alongside the 4.7GB of weights, while q8_0 halves it to
+        ~1.8GB and leaves ~1.2GB free. Quantised KV needs flash attention, which
+        is already on.
+        """
         return [
             str(self.server_bin),
             "-m", str(self.fast_model_path),
@@ -151,6 +162,8 @@ class LLMServerManager:
             "--port", str(self.fast_port),
             "--host", self.host,
             "--parallel", "2",
+            "--cache-type-k", FAST_KV_CACHE_TYPE,
+            "--cache-type-v", FAST_KV_CACHE_TYPE,
             "--flash-attn", FLASH_ATTN,
         ]
 
