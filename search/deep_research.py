@@ -166,6 +166,7 @@ class DeepResearcher:
         depth: int = DEFAULT_DEPTH,
         *,
         intent: Any = None,
+        progress: Callable[[str], None] | None = None,
     ) -> ResearchReport:
         """Run the full loop and return (and persist) a report.
 
@@ -174,6 +175,9 @@ class DeepResearcher:
         ``ACADEMIC`` the Semantic Scholar path is taken. An academic query is
         also detected from the wording, so a caller that has not classified the
         query still gets papers.
+
+        ``progress`` is an optional callback for a UI: it is called with a
+        short human-readable stage string as the run advances.
         """
         question = (question or "").strip()
         if not question:
@@ -183,6 +187,7 @@ class DeepResearcher:
         academic = _is_academic(question, intent)
 
         # Step 1 — plan.
+        self._notify(progress, "Planning research")
         sub_questions = await self._plan(question)
         if not sub_questions:
             # Planning is allowed to fail; searching the raw question is still
@@ -200,12 +205,17 @@ class DeepResearcher:
         pending = list(sub_questions)
         for iteration in range(iterations):
             # Step 2 — search sweep for the current questions.
+            head = pending[0] if pending else question
+            extra = f" (+{len(pending) - 1} more)" if len(pending) > 1 else ""
+            self._notify(progress, f"Searching: {head}{extra}")
             candidates = await self._collect_candidates(pending)
             fresh = [c for c in candidates if c["url"] not in seen]
 
             # Step 3 — score, then extract only the best.
             ranked = await self._rank(question, fresh)
-            extracted = await self._extract_urls(ranked[:MAX_EXTRACT_URLS])
+            chosen = ranked[:MAX_EXTRACT_URLS]
+            self._notify(progress, f"Reading {len(chosen)} of {len(fresh)} sources")
+            extracted = await self._extract_urls(chosen)
             for item in extracted:
                 if item["url"] in seen:
                     continue
@@ -217,12 +227,14 @@ class DeepResearcher:
                 break
 
             # Step 4 — synthesis, Step 5 — follow-up queries.
+            self._notify(progress, "Synthesising findings")
             pending = await self._find_gaps(question, sub_questions, evidence)
             if not pending:
                 logger.info("deep research found no further gaps after iteration %d", iteration + 1)
                 break
 
         # Step 6 — report.
+        self._notify(progress, "Writing report")
         report_text = await self._write_report(question, sub_questions, evidence)
         if not report_text:
             report_text = _fallback_report(question, evidence)
@@ -252,6 +264,7 @@ class DeepResearcher:
         depth: int = DEFAULT_DEPTH,
         *,
         intent: Any = None,
+        progress: Callable[[str], None] | None = None,
     ) -> threading.Thread:
         """Run :meth:`research` on a background thread.
 
@@ -262,7 +275,9 @@ class DeepResearcher:
         def worker() -> None:
             report: ResearchReport | None = None
             try:
-                report = asyncio.run(self.research(question, depth, intent=intent))
+                report = asyncio.run(
+                    self.research(question, depth, intent=intent, progress=progress)
+                )
             except Exception:
                 logger.exception("background deep research on %r failed", question)
             try:
@@ -277,14 +292,31 @@ class DeepResearcher:
         return thread
 
     def deep_research(
-        self, question: str, depth: int = DEFAULT_DEPTH, *, intent: Any = None
+        self,
+        question: str,
+        depth: int = DEFAULT_DEPTH,
+        *,
+        intent: Any = None,
+        progress: Callable[[str], None] | None = None,
     ) -> ResearchReport:
         """Synchronous wrapper around :meth:`research`.
 
         The agent's duck-typed tool contract accepts a ``deep_research`` method;
         it calls it from a synchronous turn, where awaiting is not possible.
         """
-        return asyncio.run(self.research(question, depth, intent=intent))
+        return asyncio.run(
+            self.research(question, depth, intent=intent, progress=progress)
+        )
+
+    @staticmethod
+    def _notify(progress: Callable[[str], None] | None, message: str) -> None:
+        """Report a stage to ``progress``, never letting it break the run."""
+        if progress is None:
+            return
+        try:
+            progress(message)
+        except Exception:
+            logger.debug("progress callback raised for %r", message, exc_info=True)
 
     # ------------------------------------------------------------------
     # Step 1 — planning

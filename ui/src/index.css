@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  /* System font stack only — no external font is ever fetched at runtime. */
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  background-color: #020617;
+  color: #e2e8f0;
+  overscroll-behavior: none;
+}
+
+/* Native-feeling thin scrollbars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: #334155;
+  border-radius: 9999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: #475569;
+}
+
+/* Selection is off by default (app-like), on where it is useful. */
+input,
+textarea,
+pre,
+code,
+.atlas-markdown {
+  user-select: text;
+}
+
+.recharts-tooltip-wrapper {
+  outline: none;
+}
