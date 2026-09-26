@@ -216,6 +216,21 @@ QUICK_SEARCH_RESULTS: int = 4
 DEEP_RESEARCH_MAX_ITERATIONS: int = 5
 DEEP_RESEARCH_MAX_SOURCES: int = 12
 
+# Engines SearXNG fans out to for general and news lookups, as a comma-separated
+# list (SearXNG's own `engines=` parameter). Every name here is enabled in
+# services/searxng/settings.yml — google, bing and yahoo ship `disabled: true`
+# in SearXNG's defaults and that file turns them back on. Kept in config so the
+# engine mix can be retuned without touching search/quick_search.py.
+SEARXNG_ENGINES: str = _env_or(
+    "SEARXNG_ENGINES", "google,bing,duckduckgo,brave,wikipedia"
+)
+
+# How long an identical query reuses its SearXNG result set, in seconds. SearXNG
+# has no search-result cache of its own (searx.cache only backs favicons,
+# weather, currency tables and tracker patterns), so repeated queries — which
+# deep research produces in bulk — are made cheap here instead. 0 disables it.
+SEARCH_CACHE_TTL_SECONDS: int = _int_env("SEARCH_CACHE_TTL_SECONDS", 600)
+
 # ---------------------------------------------------------------------------
 # MEMORY
 # ---------------------------------------------------------------------------

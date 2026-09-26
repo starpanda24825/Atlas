@@ -13,6 +13,15 @@ If the SearXNG container is not running this degrades rather than fails: the
 request is retried against DuckDuckGo through the ``ddgs`` library. If that is
 missing too, the methods return an honest "no results" string.
 
+Repeated queries are cheap. SearXNG has no result cache of its own
+(``searx.cache`` only backs favicons, weather, currency tables and tracker
+patterns), so an identical request is served from :class:`SearchCache` for
+:data:`core.config.SEARCH_CACHE_TTL_SECONDS` (10 minutes by default) instead of
+hitting the network again. Only successful SearXNG responses are cached.
+
+The engine mix comes from :data:`core.config.SEARXNG_ENGINES` and is
+configured on the other side in ``services/searxng/settings.yml``.
+
 Three entry points:
 
 * :meth:`QuickSearch.search`          — general lookup.
@@ -34,9 +43,18 @@ from __future__ import annotations
 import logging
 import math
 import re
+import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Iterable
 
-from core.config import QUICK_SEARCH_RESULTS, SEARXNG_URL
+from core.config import (
+    QUICK_SEARCH_RESULTS,
+    SEARCH_CACHE_TTL_SECONDS,
+    SEARXNG_ENGINES,
+    SEARXNG_URL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,16 +62,25 @@ logger = logging.getLogger(__name__)
 # Tuning
 # ---------------------------------------------------------------------------
 
-#: Per-request ceiling. Deliberately above the 2-second target: a healthy
-#: SearXNG answers in tens of milliseconds, so this only bounds a hung server.
+#: Per-request ceiling. Matches `outgoing.request_timeout` in the SearXNG
+#: instance's settings.yml, and deliberately above the 2-second target: a
+#: healthy SearXNG answers in tens of milliseconds, so this only bounds a hung
+#: server. (It is also what lets a slow engine like yahoo contribute: it was
+#: measured timing out at the old 3.0s ceiling.)
 REQUEST_TIMEOUT: float = 4.0
 
-#: Engines SearXNG fans out to. Passing them explicitly keeps the result set
-#: predictable instead of depending on the instance's default engine list.
-DEFAULT_ENGINES: str = "google,bing,duckduckgo"
+#: Engines SearXNG fans out to, from :data:`core.config.SEARXNG_ENGINES`.
+#: Passing them explicitly keeps the result set predictable instead of
+#: depending on the instance's default engine list — and SearXNG honours an
+#: explicit list even for engines that are `disabled` in its settings, which is
+#: why this list is the real lever for coverage.
+DEFAULT_ENGINES: str = SEARXNG_ENGINES
 
 #: How far back :meth:`QuickSearch.search_news` looks, in SearXNG's vocabulary.
 NEWS_TIME_RANGE: str = "day"
+
+#: Most result sets kept in the TTL cache at once.
+CACHE_MAX_ENTRIES: int = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +90,71 @@ class SearchResult:
     title: str
     url: str
     snippet: str
+
+
+class SearchCache:
+    """Thread-safe TTL + LRU cache for SearXNG result sets.
+
+    SearXNG has no search-result cache to switch on, so this is where repeated
+    queries on the same topic get cheap. It exists for the second identical
+    query, not the first: deep research asks many closely-related questions and
+    the same query often recurs across a session.
+
+    Only *successful* SearXNG responses are stored. A ``None`` (SearXNG down)
+    or a ddgs fallback result is never cached, so a transient outage cannot be
+    pinned in place.
+    """
+
+    def __init__(self, ttl: float = SEARCH_CACHE_TTL_SECONDS, max_entries: int = CACHE_MAX_ENTRIES) -> None:
+        self.ttl = float(ttl)
+        self.max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[tuple, tuple[float, list[SearchResult]]] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.ttl > 0
+
+    def get(self, key: tuple) -> list[SearchResult] | None:
+        """Cached results for ``key``, or None when absent or expired."""
+        if not self.enabled:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self.misses += 1
+                return None
+            stored_at, results = entry
+            if now - stored_at >= self.ttl:
+                del self._entries[key]
+                self.misses += 1
+                return None
+            self._entries.move_to_end(key)
+            self.hits += 1
+            # A fresh list: callers own and mutate what they get back.
+            return list(results)
+
+    def put(self, key: tuple, results: Iterable[SearchResult]) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._entries[key] = (time.monotonic(), list(results))
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+    def stats(self) -> dict[str, int | float]:
+        """Hit/miss counters and entry count, for diagnostics."""
+        with self._lock:
+            size = len(self._entries)
+        return {"entries": size, "hits": self.hits, "misses": self.misses, "ttl": self.ttl}
 
 
 #: ``$AAPL`` style cashtags, the least ambiguous ticker signal.
@@ -97,10 +189,14 @@ class QuickSearch:
         *,
         timeout: float = REQUEST_TIMEOUT,
         engines: str = DEFAULT_ENGINES,
+        cache: SearchCache | None = None,
+        cache_ttl: float = SEARCH_CACHE_TTL_SECONDS,
     ) -> None:
         self.searxng_url = searxng_url.rstrip("/")
         self.timeout = timeout
         self.engines = engines
+        #: Reused across calls, so it must be shareable between threads.
+        self.cache = cache if cache is not None else SearchCache(cache_ttl)
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -158,12 +254,34 @@ class QuickSearch:
     # ------------------------------------------------------------------
 
     def _searxng_search(self, params: dict[str, str]) -> list[SearchResult] | None:
-        """Query SearXNG.
+        """Cache-aware SearXNG query, keyed on the exact request.
 
         Returns None when SearXNG is unreachable or answers with something that
         is not a result list, so the caller knows to fall back. An empty list is
-        a real answer ("nothing found") and is returned as-is.
+        a real answer ("nothing found"), and is cached like any other —
+        genuinely empty results are still results.
         """
+        key = self._cache_key(params)
+        if key is not None:
+            cached = self.cache.get(key)
+            if cached is not None:
+                logger.debug("search cache hit for %r", params.get("q"))
+                return cached
+
+        results = self._fetch_searxng(params)
+        if results is not None and key is not None:
+            self.cache.put(key, results)
+        return results
+
+    @staticmethod
+    def _cache_key(params: dict[str, str]) -> tuple | None:
+        """Stable cache key for a request, or None if it should not be cached."""
+        if not params.get("q"):
+            return None
+        return tuple(sorted((str(k), str(v)) for k, v in params.items()))
+
+    def _fetch_searxng(self, params: dict[str, str]) -> list[SearchResult] | None:
+        """The actual network call — the one seam tests replace."""
         try:
             import requests
         except ImportError:  # pragma: no cover - requests is installed
@@ -189,6 +307,10 @@ class QuickSearch:
             logger.warning("SearXNG returned an unexpected payload — falling back")
             return None
         return [self._from_searxng(item) for item in raw if isinstance(item, dict)]
+
+    def clear_cache(self) -> None:
+        """Drop every cached result set (e.g. after a settings change)."""
+        self.cache.clear()
 
     @staticmethod
     def _from_searxng(item: dict) -> SearchResult:
