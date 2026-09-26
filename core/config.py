@@ -188,8 +188,20 @@ MAX_SESSION_TURNS: int = 8
 # ---------------------------------------------------------------------------
 
 WAKE_WORDS: list[str] = ["hey atlas", "atlas", "hey at this"]
-WAKE_WORD_MODEL_DIR: Path = BASE_DIR / "models" / "wake_word"
+
+# Where a trained custom wake word model lives, and what it is called. The
+# listening daemon looks for ``<WAKE_WORD_MODEL_NAME>.onnx`` (then ``.tflite``)
+# in this directory and falls back to a pre-built stand-in until it is there.
+# Both are overridable by environment so a retrained model can be swapped in
+# without editing this file: ATLAS_WAKE_WORD_MODEL_DIR / ATLAS_WAKE_WORD_MODEL.
+WAKE_WORD_MODEL_DIR: Path = Path(
+    _env_or("ATLAS_WAKE_WORD_MODEL_DIR", str(BASE_DIR / "models" / "wake_word"))
+)
+WAKE_WORD_MODEL_NAME: str = _env_or("ATLAS_WAKE_WORD_MODEL", "hey_atlas")
 WAKE_WORD_THRESHOLD: float = 0.5
+
+# Length of each recording taken while collecting training samples, in seconds.
+WAKE_WORD_SAMPLE_SECONDS: float = 2.5
 
 # ---------------------------------------------------------------------------
 # SEARCH

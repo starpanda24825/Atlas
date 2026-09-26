@@ -1,0 +1,2 @@
+# Trained wake word models land here (hey_atlas.onnx / hey_atlas.tflite).
+# Kept so the directory exists before the first training run.

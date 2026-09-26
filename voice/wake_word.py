@@ -55,62 +55,32 @@ Run it standalone (logs every detection, drives no LLM)::
 # Training a custom "Hey Atlas" model
 # ---------------------------------------------------------------------------
 # openWakeWord ships no "hey atlas" model, so by default this daemon falls back
-# to a pre-built stand-in and warns about it. To train the real thing:
+# to a pre-built stand-in and warns about it. To make it hear *you*, run the
+# local trainer — it records your clips, fits a small classifier over
+# openWakeWord's own audio features, and installs it:
 #
-# The trainer is a three-stage CLI. Note what it actually does: it
-# *synthesises* its own positive samples with Piper TTS and needs background
-# noise and room-impulse-response corpora. It does not consume your own
-# recordings directly — the official notebook workflow is where real recordings
-# are folded in alongside the synthetic ones.
+#     .venv/bin/python -m voice.wake_word_samples mic-check   # test the mic
+#     .venv/bin/python -m voice.wake_word_train --record      # record + train
 #
-#   1. Install the training extras. These are deliberately NOT in
-#      requirements.txt: they pull multi-GB ML dependencies that the listening
-#      daemon must never import.
+# That writes ``<wake_word>.joblib`` (the trained verifier) and
+# ``<wake_word>.json`` (the recommended threshold) into WAKE_WORD_MODEL_DIR.
+# Both are picked up automatically on the next start — see :meth:`_load_model`,
+# which prefers, in order:
 #
-#          .venv/bin/python -m pip install torchinfo torchmetrics
+#   1. a full custom network   (``hey_atlas.onnx``)
+#   2. a trained verifier      (``hey_atlas.joblib``) over a base model
+#   3. a pre-built stand-in    (with a warning)
 #
-#   2. Clone Piper (for synthetic positives) and openWakeWord (for the
-#      reference training config and notebooks).
-#
-#          git clone https://github.com/rhasspy/piper.git
-#          git clone https://github.com/dscripka/openWakeWord.git
-#
-#   3. Write a training config YAML, modelled on
-#      openWakeWord/notebooks/train_custom_model.ipynb. The keys the CLI reads
-#      are: model_name, model_type, target_phrase, output_dir, n_samples,
-#      n_samples_val, tts_batch_size, augmentation_rounds,
-#      augmentation_batch_size, total_length, batch_n_per_class, steps,
-#      max_negative_weight, target_false_positives_per_hour, layer_size,
-#      feature_data_files, custom_negative_phrases, rir_paths, background_paths,
-#      background_paths_duplication_rate, false_positive_validation_data_path
-#      and piper_sample_generator_path. Minimum viable version:
-#
-#          model_name: hey_atlas
-#          model_type: dnn
-#          target_phrase: ["hey atlas"]
-#          output_dir: /home/starpanda/Documents/Projects/AI/Atlas/models
-#          n_samples: 5000
-#          piper_sample_generator_path: /path/to/piper/src/python
-#          rir_paths: [/path/to/mit_ir_survey]
-#          background_paths: [/path/to/background_noise]
-#          # ...plus the remaining keys from the notebook
-#
-#   4. Run the three stages in order (each reads the previous stage's output):
-#
-#          .venv/bin/python -m openwakeword.train --training_config train_hey_atlas.yaml --generate_clips
-#          .venv/bin/python -m openwakeword.train --training_config train_hey_atlas.yaml --augment_clips
-#          .venv/bin/python -m openwakeword.train --training_config train_hey_atlas.yaml --train_model
-#
-#   5. Copy the resulting hey_atlas.onnx into models/wake_word/ (see
-#      WAKE_WORD_MODEL_DIR in core/config.py). This daemon picks it up
-#      automatically on the next start and stops warning.
-#
-# Tip for a quick sanity check before committing to a full training run: record
-# a handful of 16 kHz mono 16-bit WAVs of yourself saying "Hey Atlas" and score
-# them with Model.predict_clip() — it runs the same streaming pipeline on a file.
+# Route 2 is the local, no-download path: openWakeWord runs the verifier on
+# every frame and *replaces* the base model's score with its probability, so a
+# dozen recordings of your own voice is enough. Route 1 remains available via
+# openWakeWord's own three-stage ``--training_config`` pipeline, which
+# synthesises its positives with Piper and needs background-noise and
+# room-impulse-response corpora plus torch/onnx; it is why route 2 exists.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -121,6 +91,7 @@ from core.config import (
     CHANNELS,
     SAMPLE_RATE,
     WAKE_WORD_MODEL_DIR,
+    WAKE_WORD_MODEL_NAME,
     WAKE_WORD_THRESHOLD,
 )
 
@@ -148,9 +119,9 @@ FRAME_SAMPLES = 1280
 FRAME_DTYPE = "int16"
 
 # --- Detection --------------------------------------------------------------
-# The model we actually want, and the pre-built models used as stand-ins until
-# it has been trained. Order matters: the first one that exists wins.
-WAKE_WORD_MODEL_NAME = "hey_atlas"
+# The model we want is configured as WAKE_WORD_MODEL_NAME (imported above), and
+# read from ``models/wake_word/``. Until it has been trained this falls back to
+# the pre-built models below — order matters: the first one that exists wins.
 FALLBACK_MODEL_NAMES = ("alexa", "hey_mycroft")
 
 # See the module docstring: tflite-runtime is broken against NumPy 2.x here.
@@ -162,6 +133,39 @@ COOLDOWN_SECONDS = 2.0
 
 # How long to wait before reopening the microphone after a device error.
 RECONNECT_DELAY_SECONDS = 5.0
+
+
+def available_pretrained_models(framework: str = INFERENCE_FRAMEWORK) -> list[str]:
+    """Paths of the pre-built models bundled with this openWakeWord install."""
+    try:
+        import openwakeword
+    except ImportError:  # pragma: no cover - depends on environment
+        return []
+    try:
+        return [str(path) for path in openwakeword.get_pretrained_model_paths(framework)]
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("could not enumerate pre-trained models", exc_info=True)
+        return []
+
+
+def resolve_base_model_name(
+    fallback_names: tuple[str, ...] = FALLBACK_MODEL_NAMES,
+    framework: str = INFERENCE_FRAMEWORK,
+) -> str:
+    """First pre-built model available in this installation.
+
+    Doubles as the feature extractor for a trained verifier, so the trainer and
+    the daemon must agree on which model this resolves to.
+    """
+    available = available_pretrained_models(framework)
+    for name in fallback_names:
+        if any(name in Path(path).stem for path in available):
+            return name
+    raise RuntimeError(
+        f"None of the pre-built stand-ins {fallback_names} are installed. Run "
+        '`python -c "import openwakeword; '
+        'openwakeword.utils.download_models()"` first.'
+    )
 
 
 class WakeWordDaemon:
@@ -200,6 +204,9 @@ class WakeWordDaemon:
         self.model_key: str | None = None
         self.model_source: str | None = None
         self.using_custom_model: bool = False
+        #: True when a trained verifier (``<name>.joblib``) is driving detection
+        #: on top of a base model, instead of a full custom wake word network.
+        self.using_custom_verifier: bool = False
 
         self._load_model()
 
@@ -215,7 +222,8 @@ class WakeWordDaemon:
     def __repr__(self) -> str:
         return (
             f"<WakeWordDaemon model={self.model_source!r} "
-            f"custom={self.using_custom_model} threshold={self.threshold}>"
+            f"custom={self.using_custom_model} "
+            f"verifier={self.using_custom_verifier} threshold={self.threshold}>"
         )
 
     # ------------------------------------------------------------------
@@ -254,15 +262,7 @@ class WakeWordDaemon:
 
     @staticmethod
     def _pretrained_model_paths(framework: str) -> list[str]:
-        try:
-            import openwakeword
-        except ImportError:  # pragma: no cover - depends on environment
-            return []
-        try:
-            return list(openwakeword.get_pretrained_model_paths(framework))
-        except Exception:  # pragma: no cover - defensive
-            logger.debug("could not enumerate pre-trained models", exc_info=True)
-            return []
+        return available_pretrained_models(framework)
 
     # ------------------------------------------------------------------
     # Model loading
@@ -284,48 +284,84 @@ class WakeWordDaemon:
         return None
 
     def _fallback_model_name(self) -> str:
-        """First pre-built model available in this installation."""
-        available = self._pretrained_model_paths(INFERENCE_FRAMEWORK)
-        for name in self.fallback_names:
-            if any(name in Path(path).stem for path in available):
-                return name
-        raise RuntimeError(
-            f"No '{self.wake_word}' model in {self.model_dir} and none of the "
-            f"pre-built stand-ins {self.fallback_names} are installed. Run "
-            "`python -c \"import openwakeword; "
-            "openwakeword.utils.download_models()\"` first."
-        )
+        return resolve_base_model_name(self.fallback_names, INFERENCE_FRAMEWORK)
+
+    def _custom_verifier_path(self) -> Path | None:
+        """The trained verifier for this wake word, if one has been built.
+
+        The trainer writes ``models/wake_word/<wake_word>.joblib``. openWakeWord
+        applies it on top of a base model and replaces that model's score with
+        the verifier's probability — see :meth:`_build_model`.
+        """
+        candidate = self.model_dir / f"{self.wake_word}.joblib"
+        return candidate if candidate.is_file() else None
+
+    def _verifier_threshold(self) -> float | None:
+        """Recommended threshold the trainer recorded next to the verifier."""
+        sidecar = self.model_dir / f"{self.wake_word}.json"
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            value = float(payload["threshold"])
+        except Exception:
+            return None
+        return min(max(value, 0.01), 0.99)
 
     def _load_model(self) -> None:
-        """Load the custom model, or fall back to a pre-built one with a warning."""
+        """Load the best available model for this wake word.
+
+        Preference order:
+
+        1. a full custom network (:file:`<wake_word>.onnx`),
+        2. a trained verifier (:file:`<wake_word>.joblib`) applied over a base
+           model — what :mod:`voice.wake_word_train` produces,
+        3. a pre-built stand-in, with a warning.
+        """
         Model = self._import_model_class()
 
-        source, is_custom = self._custom_model_path(), True
-        if source is None:
-            source, is_custom = self._fallback_model_name(), False
+        source = self._custom_model_path()
+        is_custom = source is not None
+        verifier = None if is_custom else self._custom_verifier_path()
+
+        if is_custom:
+            pass
+        elif verifier is not None:
+            source = self._fallback_model_name()
+            logger.info(
+                "trained '%s' verifier found — detecting '%s' on top of the "
+                "'%s' base model",
+                self.wake_word,
+                self.wake_word,
+                source,
+            )
+        else:
+            source = self._fallback_model_name()
             logger.warning(
                 "Custom '%s' model not found in %s — falling back to the "
                 "pre-built '%s' model as a placeholder. Say the stand-in phrase "
-                "instead until a custom model is trained (see the training notes "
-                "in voice/wake_word.py).",
+                "instead until a custom model is trained (run "
+                "`python -m voice.wake_word_train`).",
                 self.wake_word,
                 self.model_dir,
                 source,
             )
 
         try:
-            model = self._build_model(Model, str(source))
+            model = self._build_model(
+                Model, str(source), str(verifier) if verifier is not None else None
+            )
         except Exception:
-            if not is_custom:
+            if not is_custom and verifier is None:
                 raise
             # A half-trained or wrong-framework custom file must not take the
             # daemon down; degrade to the stand-in and say so loudly.
             logger.exception(
-                "could not load custom model %s — falling back to a pre-built "
-                "stand-in so wake word detection keeps working",
-                source,
+                "could not load custom '%s' model — falling back to a "
+                "pre-built stand-in so wake word detection keeps working",
+                self.wake_word,
             )
-            source, is_custom = self._fallback_model_name(), False
+            source = self._fallback_model_name()
+            is_custom = False
+            verifier = None
             model = self._build_model(Model, str(source))
 
         keys = list(model.models.keys())
@@ -338,23 +374,38 @@ class WakeWordDaemon:
         self.model_key = keys[0]
         self.model_source = str(source)
         self.using_custom_model = is_custom
+        self.using_custom_verifier = verifier is not None
+
+        if verifier is not None:
+            recommended = self._verifier_threshold()
+            if recommended is not None:
+                self.threshold = recommended
 
         logger.info(
-            "wake word model ready: %s (custom=%s, threshold=%.2f)",
+            "wake word model ready: %s (custom=%s, verifier=%s, threshold=%.2f)",
             self.model_source,
             is_custom,
+            self.using_custom_verifier,
             self.threshold,
         )
 
     @staticmethod
-    def _build_model(Model: Any, source: str) -> Any:
+    def _build_model(Model: Any, source: str, verifier: str | None = None) -> Any:
         # enable_speex_noise_suppression stays off: it is tflite-only and adds a
         # dependency the CUDA-free path does not need.
-        return Model(
-            wakeword_models=[source],
-            inference_framework=INFERENCE_FRAMEWORK,
-            enable_speex_noise_suppression=False,
-        )
+        kwargs: dict[str, Any] = {
+            "wakeword_models": [source],
+            "inference_framework": INFERENCE_FRAMEWORK,
+            "enable_speex_noise_suppression": False,
+        }
+        if verifier is not None:
+            # openWakeWord runs the verifier on every frame and *replaces* the
+            # base model's score with its probability, so threshold 0.0 here is
+            # what makes the verifier's output the detection score.
+            key = Path(source).stem if Path(source).is_file() else source
+            kwargs["custom_verifier_models"] = {key: verifier}
+            kwargs["custom_verifier_threshold"] = 0.0
+        return Model(**kwargs)
 
     # ------------------------------------------------------------------
     # Listening
@@ -481,7 +532,10 @@ if __name__ == "__main__":  # pragma: no cover - manual smoke test
     )
 
     daemon = WakeWordDaemon()
-    print(f"model: {daemon.model_source} (custom={daemon.using_custom_model})")
+    print(
+        f"model: {daemon.model_source} "
+        f"(custom={daemon.using_custom_model}, verifier={daemon.using_custom_verifier})"
+    )
     print("Say the wake word, or press Ctrl-C to quit.")
 
     def on_wake() -> None:
