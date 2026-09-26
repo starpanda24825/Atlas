@@ -1,0 +1,34 @@
+[Unit]
+Description=Atlas — local AI assistant daemon
+Documentation=file:%h/Documents/Projects/AI/Atlas/services/README.md
+# searxng.service is the real dependency: Atlas' quick search queries it, and
+# startup is cheaper if it is already up.
+Wants=searxng.service
+After=searxng.service network.target
+
+[Service]
+Type=simple
+# No User=/Group= here on purpose: this is a *user* unit, so it already runs as
+# the user who started it, and systemd rejects those settings in a user unit.
+# Everything the daemon touches by relative path (models/, logs/, chroma_db/,
+# vault/, uploads/) lives under the repo root, so this must be set.
+WorkingDirectory=%h/Documents/Projects/AI/Atlas
+# The leading `-` makes the file optional. `.env` is gitignored and may not
+# exist yet; without the `-` the unit would refuse to start. core/config.py also
+# loads this file itself, so the values land either way — this is belt-and-
+# braces, and lets you override anything from the environment.
+EnvironmentFile=-%h/Documents/Projects/AI/Atlas/.env
+# Unbuffered stdout so the daemon's console log reaches the journal live rather
+# than in 8 KB blocks. Structured JSON logs still go to logs/atlas.log.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/Documents/Projects/AI/Atlas/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+# The daemon installs SIGTERM/SIGINT handlers that stop the wake word listener,
+# the model servers and flush pending memory writes. Give that room; the default
+# 90s is plenty but 45s keeps a stuck shutdown from blocking logout for long.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target

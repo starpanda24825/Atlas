@@ -1,0 +1,31 @@
+[Unit]
+Description=SearXNG search backend for Atlas (Docker Compose)
+Documentation=file:%h/Documents/Projects/AI/Atlas/services/searxng/README.md
+# SearXNG is the one thing Atlas reaches over HTTP at startup, so start it
+# first. It is itself a *user* unit wrapping Docker, so ordering here is only
+# meaningful between user units — see the note in atlas.service.
+
+[Service]
+Type=simple
+# `docker compose -f <abs path>` resolves the compose file's relative bind
+# mounts (./searxng:/etc/searxng) against the project directory, so pin both
+# the path and the working directory. Note that `~` is NOT expanded by systemd,
+# which is why every path below is absolute.
+WorkingDirectory=%h/searxng
+# No `-d`: compose runs in the foreground and streams container logs to the
+# journal, which is what makes Type=simple the right choice here.
+ExecStart=/usr/bin/docker compose -f %h/searxng/docker-compose.yml up
+ExecStop=/usr/bin/docker compose -f %h/searxng/docker-compose.yml down
+# `always` as specified: if the compose process dies (or Docker restarts), bring
+# the stack back. RestartSec keeps a persistent failure from hot-looping.
+Restart=always
+RestartSec=5
+# Pulling/starting containers can take a while on a cold cache.
+TimeoutStartSec=120
+# `down` stops containers gracefully before removing them.
+TimeoutStopSec=60
+
+[Install]
+# `default.target` is the user-session equivalent of multi-user.target; there is
+# no multi-user.target in the user manager.
+WantedBy=default.target

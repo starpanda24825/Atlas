@@ -1,0 +1,41 @@
+[Unit]
+Description=Atlas UI (Tauri desktop app)
+Documentation=file:%h/Documents/Projects/AI/Atlas/services/README.md
+# The UI is a thin client over the daemon's HTTP/WebSocket API, so the daemon
+# should be up first. It starts fine without it (the UI just shows the daemon as
+# offline) but this avoids a flash of "disconnected".
+Wants=atlas.service
+After=atlas.service
+
+[Service]
+Type=simple
+# OPTIONAL UNIT — installed but deliberately NOT enabled by services/install.sh.
+# Open the UI by hand, or `systemctl --user enable --now atlas-ui` to autostart
+# it on login.
+#
+# BUILD IT FIRST. This points at the binary produced by `cargo build --release`
+# inside ui/src-tauri:
+#
+#     cd ui && npm run tauri build      # or: cargo build --release
+#
+# Tauri names the binary after the Cargo package (`tauri-app`), not after
+# `productName` ("Atlas") — `mainBinaryName` is unset in ui/src-tauri/
+# tauri.conf.json, and Tauri's own config schema documents that as "use the
+# output binary from cargo". Installing the bundled .deb would instead put the
+# `productName` binary on PATH, which is what `ExecStart=/usr/bin/Atlas` would
+# refer to; run `which Atlas` if you went that route and adjust accordingly.
+WorkingDirectory=%h/Documents/Projects/AI/Atlas
+ExecStart=%h/Documents/Projects/AI/Atlas/ui/src-tauri/target/release/tauri-app
+# A graphical app needs the session environment. Started from a login session it
+# is usually inherited; if no window appears, import it first:
+#   systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY
+#   systemctl --user restart atlas-ui
+# On X11 you may also need DISPLAY; uncomment and adjust if so:
+#Environment=DISPLAY=:0
+# Restart only on failure: closing the window (or quitting from the tray) is a
+# clean exit and must not resurrect the app.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
