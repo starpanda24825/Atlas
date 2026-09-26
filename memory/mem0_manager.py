@@ -718,6 +718,60 @@ class Mem0Manager:
     # Housekeeping
     # ------------------------------------------------------------------
 
+    def consolidate(self) -> dict[str, Any]:
+        """Idle housekeeping: drop memories that are exact duplicates.
+
+        Called automatically by :class:`core.resource_governor.ResourceGovernor`
+        during the idle-compute window, hence the deliberately narrow definition
+        of "consolidate": it removes a memory only when its *normalised* text is
+        identical to a newer one, so no distinct information is ever lost. It
+        never merges, rewrites or summarises — an automatic pass that silently
+        rewrote the user's memories would be impossible to audit.
+
+        Returns a report dict; never raises.
+        """
+        try:
+            flushed = self.wait_for_pending()
+        except Exception:
+            logger.debug("wait_for_pending failed before consolidation", exc_info=True)
+            flushed = False
+
+        try:
+            memories = self.get_all()
+        except Exception:
+            logger.exception("could not read memories for consolidation")
+            return {"flushed": flushed, "total": 0, "duplicates": 0, "removed": 0}
+
+        # get_all() is newest-first, so the first time a text is seen is the
+        # copy worth keeping.
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for item in memories:
+            text = _normalise_memory_text(item.get("memory") or "")
+            if not text:
+                continue
+            if text in seen:
+                memory_id = str(item.get("id") or "")
+                if memory_id:
+                    duplicates.append(memory_id)
+            else:
+                seen.add(text)
+
+        removed = sum(1 for memory_id in duplicates if self.delete(memory_id))
+        report = {
+            "flushed": flushed,
+            "total": len(memories),
+            "duplicates": len(duplicates),
+            "removed": removed,
+            "kept": len(memories) - removed,
+        }
+        logger.info("memory consolidation: %s", report)
+        return report
+
+    # ------------------------------------------------------------------
+    # Housekeeping
+    # ------------------------------------------------------------------
+
     def wait_for_pending(self, timeout: float = 60.0) -> bool:
         """Block until any in-flight extraction has finished.
 
@@ -774,6 +828,11 @@ class Mem0Manager:
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
+
+
+def _normalise_memory_text(text: Any) -> str:
+    """Case- and whitespace-insensitive form, for spotting exact duplicates."""
+    return " ".join(str(text or "").lower().split())
 
 
 def normalise_memory(item: Any) -> dict[str, Any]:

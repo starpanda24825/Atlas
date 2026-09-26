@@ -86,6 +86,7 @@ Usage::
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -415,6 +416,12 @@ TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                 "enum": ["market", "limit"],
                 "description": "Order type. Defaults to market.",
             },
+            "limit_price": {
+                "type": "number",
+                "description": (
+                    "Limit price. Required when order_type is 'limit'."
+                ),
+            },
             "confirmed": _CONFIRMED,
         },
         ["symbol", "side", "quantity"],
@@ -515,6 +522,43 @@ def _find_method(target: Any, names: Iterable[str]) -> Callable[..., Any] | None
         if callable(method):
             return method
     return None
+
+
+def _call_any(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Call ``fn``, dropping keyword arguments its signature does not accept.
+
+    Delegated modules are duck-typed too, so a parameter name that has drifted
+    (``num_questions`` where the module says ``n_questions``) should degrade to a
+    working call rather than a TypeError. A module that takes ``**kwargs`` gets
+    everything, since it can decide for itself.
+    """
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # builtins and C callables
+        return fn(*args, **kwargs)
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return fn(*args, **kwargs)
+    accepted = {key: value for key, value in kwargs.items() if key in parameters}
+    return fn(*args, **accepted)
+
+
+def _split_rag_result(result: Any) -> tuple[str, list[dict[str, Any]]]:
+    """Split a document-query result into answer text plus citation dicts.
+
+    ``UniversityRAG.query`` returns ``(context, citations)``; other shapes are
+    accepted so the tool keeps working if that contract changes.
+    """
+    if isinstance(result, tuple) and len(result) >= 2:
+        context, citations = result[0], result[1]
+    elif isinstance(result, dict):
+        context = result.get("context") or result.get("answer") or ""
+        citations = result.get("citations") or result.get("sources") or []
+    else:
+        return _as_text(result).strip(), []
+
+    text = context if isinstance(context, str) else _as_text(context)
+    found = citations if isinstance(citations, (list, tuple)) else []
+    return text.strip(), [item for item in found if isinstance(item, dict)]
 
 
 def _run_command(command: list[str], timeout: float = 5.0) -> str | None:
@@ -1551,7 +1595,20 @@ class AtlasAgent:
                     ),
                 }
             )
-        return _as_text(function(**kwargs))
+        try:
+            return _as_text(_call_any(function, **kwargs))
+        except Exception as exc:
+            # Report it as data rather than raising: the model can then tell the
+            # user something honest instead of the turn failing outright.
+            logger.warning(
+                "%s call failed: %s", callable_names[0], exc, exc_info=True
+            )
+            return _json(
+                {
+                    "error": "tool_failed",
+                    "message": f"{module_hint} could not do that: {exc}",
+                }
+            )
 
     def _tool_execute_trade(
         self,
@@ -1559,18 +1616,72 @@ class AtlasAgent:
         side: str,
         quantity: float,
         order_type: str = "market",
+        limit_price: float | None = None,
         confirmed: bool = False,
     ) -> str:
-        return self._delegate(
-            "modules.trading.execution",
-            ("execute_trade", "submit_order", "place_order"),
-            "The trading module",
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            order_type=order_type,
-            paper=True,
-        )
+        """Propose a trade, then submit it — the executor's two-step contract.
+
+        ``propose_trade`` only validates and records a pending trade; it never
+        contacts the broker. ``confirm_and_execute`` is the single path that
+        submits, and it is reachable only after the user has agreed, because
+        :data:`CONFIRMATION_REQUIRED` holds this tool back until then. Paper
+        trading is the executor's default and is not something the model can
+        override from here.
+        """
+        try:
+            module = __import__("modules.trading.execution", fromlist=["*"])
+        except ImportError:
+            return _json(
+                {
+                    "error": "unavailable",
+                    "message": (
+                        "The trading module is not implemented yet. Tell the "
+                        "user this capability is not ready rather than guessing."
+                    ),
+                }
+            )
+
+        propose = _find_method(module, ("propose_trade",))
+        submit = _find_method(module, ("confirm_and_execute", "confirm_trade"))
+        if propose is None or submit is None:
+            return _json(
+                {
+                    "error": "unavailable",
+                    "message": (
+                        "The trading module cannot place orders. Tell the user "
+                        "this capability is not ready rather than guessing."
+                    ),
+                }
+            )
+
+        try:
+            pending = _call_any(
+                propose,
+                symbol=symbol,
+                qty=quantity,
+                side=side,
+                order_type=order_type,
+                limit_price=limit_price,
+            )
+        except Exception as exc:
+            logger.warning("trade proposal for %s failed: %s", symbol, exc)
+            return _json({"error": "trade_rejected", "message": str(exc)})
+
+        trade_id = pending.get("trade_id") if isinstance(pending, dict) else None
+        if not trade_id:
+            # No id means the executor refused it (bad symbol, quantity or
+            # side), so nothing was proposed and there is nothing to confirm.
+            return _json({"error": "trade_rejected", "proposal": pending})
+
+        try:
+            outcome = _call_any(submit, trade_id=trade_id, confirmed=bool(confirmed))
+        except Exception as exc:
+            logger.warning("trade submission %s failed: %s", trade_id, exc)
+            return _json(
+                {"error": "trade_failed", "trade_id": trade_id, "message": str(exc)}
+            )
+
+        return _json({"proposed": pending, "result": outcome})
 
     def _tool_run_backtest(
         self, strategy: str, symbol: str, period: str | None = None
@@ -1585,20 +1696,82 @@ class AtlasAgent:
         )
 
     def _tool_query_documents(self, question: str) -> str:
-        return self._delegate(
-            "modules.university.rag",
-            ("query_documents", "query", "answer"),
-            "The study-materials search",
-            question=question,
-        )
+        """Answer from the indexed study materials, with citations.
+
+        Not routed through :meth:`_delegate` because ``UniversityRAG.query``
+        returns a ``(context, citations)`` tuple: flattened by ``_as_text`` that
+        would hand the model the citation dicts as a raw JSON dump.
+        """
+        try:
+            module = __import__("modules.university.rag", fromlist=["*"])
+        except ImportError:
+            return _json(
+                {
+                    "error": "unavailable",
+                    "message": (
+                        "The study-materials search is not implemented yet. "
+                        "Tell the user this capability is not ready rather "
+                        "than guessing at an answer."
+                    ),
+                }
+            )
+
+        query = _find_method(module, ("query", "query_documents", "answer"))
+        if query is None:
+            return _json(
+                {
+                    "error": "unavailable",
+                    "message": (
+                        "The study-materials search cannot answer questions. "
+                        "Tell the user this capability is not ready rather "
+                        "than guessing at an answer."
+                    ),
+                }
+            )
+
+        try:
+            result = _call_any(query, question=question)
+        except Exception as exc:
+            logger.warning("document query failed: %s", exc, exc_info=True)
+            return _json({"error": "query_failed", "message": str(exc)})
+
+        context, citations = _split_rag_result(result)
+        if not context:
+            return _json(
+                {
+                    "answer": "",
+                    "message": (
+                        "No indexed documents matched that question. Say so, and "
+                        "offer to answer from general knowledge instead."
+                    ),
+                    "citations": citations,
+                }
+            )
+
+        lines = [context]
+        if citations:
+            lines.append("")
+            lines.append("Sources:")
+            for index, citation in enumerate(citations, start=1):
+                title = (
+                    citation.get("title")
+                    or citation.get("source")
+                    or citation.get("filename")
+                    or "document"
+                )
+                page = citation.get("page")
+                lines.append(f"  {index}. {title}{f', page {page}' if page else ''}")
+        return "\n".join(lines)
 
     def _tool_generate_quiz(self, topic: str, num_questions: int = 5) -> str:
+        # The module's parameter is `n_questions`; pass that name explicitly so
+        # the count is honoured instead of silently falling back to its default.
         return self._delegate(
             "modules.university.quiz",
             ("generate_quiz", "generate", "build_quiz"),
             "The quiz generator",
             topic=topic,
-            num_questions=num_questions,
+            n_questions=num_questions,
         )
 
     # ------------------------------------------------------------------

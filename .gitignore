@@ -20,6 +20,9 @@ chroma_db/
 logs/
 *.log
 vault/
+# Documents the user uploaded through the API, alongside the vault: their own
+# data, not project source, and indexed into chroma_db/ anyway.
+uploads/
 
 # Secrets
 .env

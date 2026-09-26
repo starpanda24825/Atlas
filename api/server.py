@@ -34,7 +34,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -325,6 +325,21 @@ def _call_any(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return fn(*args, **kwargs)
     accepted = {key: value for key, value in kwargs.items() if key in parameters}
     return fn(*args, **accepted)
+
+
+def _plain(value: Any) -> Any:
+    """Flatten dataclass results (e.g. ``IngestionResult``) into JSON types.
+
+    Modules return dataclasses where the API returns dicts; those are not
+    JSON-serialisable on their own, so convert them at the boundary.
+    """
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    return value
 
 
 def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -978,11 +993,30 @@ def create_app(services: Services | None = None) -> FastAPI:
         destination = UPLOADS_DIR / _safe_filename(name)
         destination.write_bytes(data)
 
-        indexer = _first_callable(rag, ("add_document", "index_document", "index", "add"))
+        # `ingest_document(filepath)` is the real entry point; the other names
+        # are tolerated for a differently-named collaborator.
+        indexer = _first_callable(
+            rag, ("ingest_document", "add_document", "index_document", "index", "add")
+        )
         if indexer is None:
             raise HTTPException(status_code=503, detail="The document index cannot add files")
-        result = _safe(indexer, path=str(destination), filename=name)
-        return {"indexed": True, "filename": name, "path": str(destination), "result": result}
+        result = _safe(
+            indexer,
+            filepath=str(destination),
+            path=str(destination),
+            filename=name,
+        )
+        payload = _plain(result)
+        # ingest_document reports a failed parse in its result rather than
+        # raising, so surface that as a client error instead of a success.
+        if isinstance(payload, Mapping) and payload.get("error"):
+            raise HTTPException(status_code=422, detail=str(payload["error"]))
+        return {
+            "indexed": True,
+            "filename": name,
+            "path": str(destination),
+            "result": payload,
+        }
 
     @app.get("/documents")
     def list_documents(services: Services = Depends(get_services)) -> dict[str, Any]:
@@ -1002,7 +1036,14 @@ def create_app(services: Services | None = None) -> FastAPI:
         fn = _first_callable(rag, ("remove_document", "delete_document", "remove", "delete"))
         if fn is None:
             raise HTTPException(status_code=503, detail="The document index cannot remove files")
-        removed = _safe(fn, document_id=document_id, id=document_id)
+        # `remove_document(filename)` needs the filename; the other names are
+        # for a differently-shaped collaborator.
+        removed = _safe(
+            fn,
+            filename=document_id,
+            document_id=document_id,
+            id=document_id,
+        )
         if not removed:
             raise HTTPException(status_code=404, detail="document not found")
         return {"deleted": True, "id": document_id}
@@ -1015,13 +1056,30 @@ def create_app(services: Services | None = None) -> FastAPI:
         fn = _first_callable(quiz, ("generate_quiz", "generate", "build_quiz"))
         if fn is None:
             raise HTTPException(status_code=503, detail="The quiz generator is not available")
+        # `topic` is optional in the model, but the generator needs either a
+        # topic or documents to work from. Without this the request surfaced as
+        # a confusing 502 "server error" instead of a clear client error.
+        if not body.topic and not body.documents:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "give a topic, or a list of documents to draw the questions "
+                    "from"
+                ),
+            )
+        # The module's parameter is `n_questions`, and its document filter is
+        # `doc_filter`. Passing every spelling is safe: `_call_any` drops the
+        # ones the signature does not take, and without this the requested
+        # count was silently discarded and every quiz came back with 5.
         result = _safe(
             fn,
             topic=body.topic,
-            documents=body.documents,
+            n_questions=body.num_questions,
             num_questions=body.num_questions,
+            documents=body.documents,
+            doc_filter=body.documents or None,
         )
-        return {"quiz": result}
+        return {"quiz": _plain(result)}
 
     # ------------------------------------------------------------------
     # System
