@@ -498,6 +498,27 @@ def _ram_usage() -> dict[str, Any] | None:
     }
 
 
+def _governor_stats(services: Services) -> dict[str, Any] | None:
+    """System readings from the resource governor, when one is wired in.
+
+    The governor is the component that already samples VRAM, RAM, CPU,
+    battery and the current mode, so ``/status`` prefers its snapshot and only
+    falls back to reading the machine directly when it is absent.
+    """
+    governor = services.resource_governor
+    if governor is None:
+        return None
+    stats = getattr(governor, "get_system_stats", None)
+    if not callable(stats):
+        return None
+    try:
+        snapshot = stats()
+    except Exception:
+        logger.debug("resource governor stats unavailable", exc_info=True)
+        return None
+    return dict(snapshot) if isinstance(snapshot, Mapping) else None
+
+
 def _status_payload(services: Services, modes: ModeController) -> dict[str, Any]:
     """Everything ``GET /status`` and the periodic push report."""
     manager = services.llm_manager
@@ -508,7 +529,7 @@ def _status_payload(services: Services, modes: ModeController) -> dict[str, Any]
     wake = services.wake_word
     listening = bool(getattr(wake, "running", False)) if wake is not None else False
 
-    return {
+    payload: dict[str, Any] = {
         "active_model": active_model,
         "vram_usage": _vram_usage(),
         "ram_usage": _ram_usage(),
@@ -516,6 +537,29 @@ def _status_payload(services: Services, modes: ModeController) -> dict[str, Any]
         "wake_word_listening": listening,
         "deep_server_running": deep_alive,
     }
+
+    # Enrich with the governor's snapshot without changing the shape the UI
+    # already depends on (``vram_usage``/``ram_usage``/``active_mode``).
+    stats = _governor_stats(services)
+    if stats:
+        used = stats.get("vram_used_mb")
+        total = stats.get("vram_total_mb")
+        if used is not None and total:
+            percent = stats.get("vram_percent")
+            payload["vram_usage"] = {
+                "used_mb": used,
+                "total_mb": total,
+                "percent": round(percent, 1) if percent is not None else round(used / total * 100, 1),
+            }
+        ram = payload.get("ram_usage")
+        if isinstance(ram, dict) and stats.get("ram_percent") is not None:
+            ram["percent"] = stats["ram_percent"]
+        payload["cpu_percent"] = stats.get("cpu_percent")
+        payload["battery_percent"] = stats.get("battery_percent")
+        payload["charging"] = stats.get("charging_bool")
+        payload["power_saving"] = stats.get("power_saving")
+
+    return payload
 
 
 # ---------------------------------------------------------------------------
